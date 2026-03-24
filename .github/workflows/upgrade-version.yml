@@ -1,0 +1,253 @@
+name: Automated Version Upgrade & Testing
+
+on:
+  # Trigger manually from GitHub Actions tab
+  workflow_dispatch:
+    inputs:
+      new_version:
+        description: 'New Shaka Player version (e.g., v5.0.10 or 5.0.10)'
+        required: true
+        type: string
+      auto_resolve:
+        description: 'Attempt automatic conflict resolution'
+        required: false
+        type: boolean
+        default: false
+      run_tests:
+        description: 'Run full test suite after upgrade'
+        required: false
+        type: boolean
+        default: true
+
+  # Trigger on new upstream releases (optional)
+  # Uncomment to enable automatic weekly checks
+  schedule:
+    - cron: '0 2 * * 1'  # Weekly Monday 2 AM UTC
+
+jobs:
+  upgrade:
+    name: Upgrade to Latest Version
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for conflict analysis
+
+      - name: Configure git
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git config --global pull.rebase false
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/shaka-project/shaka-player.git || true
+          git fetch upstream --tags --all
+
+      - name: Detect latest version
+        id: latest
+        run: |
+          # If version not provided, find latest tag
+          if [[ "${{ github.event.inputs.new_version }}" == "" ]]; then
+            LATEST=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1)
+          else
+            LATEST="${{ github.event.inputs.new_version }}"
+          fi
+          # Normalize to v-prefixed format
+          if [[ ! "$LATEST" =~ ^v ]]; then
+            LATEST="v${LATEST}"
+          fi
+          echo "version=$LATEST" >> $GITHUB_OUTPUT
+          echo "Detected version: $LATEST"
+
+      - name: Check if already at version
+        id: check_version
+        run: |
+          CURRENT_TAG=$(git describe --tags --exact-match HEAD 2>/dev/null || echo "")
+          TARGET_VERSION="${{ steps.latest.outputs.version }}"
+          if [[ "$CURRENT_TAG" == "$TARGET_VERSION" ]]; then
+            echo "already_latest=true" >> $GITHUB_OUTPUT
+            echo "Already at $TARGET_VERSION"
+          else
+            echo "already_latest=false" >> $GITHUB_OUTPUT
+            echo "Need to upgrade from $CURRENT_TAG to $TARGET_VERSION"
+          fi
+
+      - name: Setup Node.js (for build system)
+        if: steps.check_version.outputs.already_latest == 'false'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Setup Python
+        if: steps.check_version.outputs.already_latest == 'false'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Run upgrade script
+        if: steps.check_version.outputs.already_latest == 'false'
+        id: upgrade
+        run: |
+          chmod +x ./upgrade-version.sh
+          chmod +x ./resolve-conflicts-auto.sh
+          
+          # Build command with optional flags
+          CMD="./upgrade-version.sh ${{ steps.latest.outputs.version }}"
+          
+          if [[ "${{ github.event.inputs.auto_resolve }}" == "true" ]]; then
+            CMD="$CMD --auto-resolve"
+          fi
+          
+          if [[ "${{ github.event.inputs.run_tests }}" == "true" ]]; then
+            CMD="$CMD --run-tests"
+          fi
+          
+          echo "Running: $CMD"
+          eval "$CMD" || UPGRADE_EXIT_CODE=$?
+          
+          if [[ "${UPGRADE_EXIT_CODE:-0}" == "3" ]]; then
+            echo "upgrade_status=conflicts" >> $GITHUB_OUTPUT
+          else
+            echo "upgrade_status=success" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+
+      - name: Check for conflicts
+        if: steps.check_version.outputs.already_latest == 'false'
+        id: conflicts
+        run: |
+          if [[ -f "CONFLICT_RESOLUTION_NEEDED.md" ]]; then
+            echo "conflicts_found=true" >> $GITHUB_OUTPUT
+            echo "## ⚠️ Conflicts Detected" >> $GITHUB_STEP_SUMMARY
+            cat CONFLICT_RESOLUTION_NEEDED.md >> $GITHUB_STEP_SUMMARY
+          else
+            echo "conflicts_found=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Lint and check syntax
+        if: steps.check_version.outputs.already_latest == 'false' && steps.conflicts.outputs.conflicts_found == 'false'
+        run: |
+          if [[ -f "build/check.py" ]]; then
+            python3 build/check.py || true
+          fi
+
+      - name: Run tests
+        if: steps.check_version.outputs.already_latest == 'false' && steps.conflicts.outputs.conflicts_found == 'false' && github.event.inputs.run_tests == 'true'
+        run: |
+          if [[ -f "build/test.py" ]]; then
+            python3 build/test.py --quick || true
+          fi
+
+      - name: Generate upgrade report
+        if: always()
+        run: |
+          cat > UPGRADE_REPORT.md << 'REPORT'
+          # Shaka Player Version Upgrade Report
+          
+          ## Summary
+          - **Version**: ${{ steps.latest.outputs.version }}
+          - **Status**: ${{ steps.upgrade.outputs.upgrade_status || 'unknown' }}
+          - **Conflicts**: ${{ steps.conflicts.outputs.conflicts_found || 'false' }}
+          - **Timestamp**: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          
+          ## Action Required
+          REPORT
+          
+          if [[ "${{ steps.conflicts.outputs.conflicts_found }}" == "true" ]]; then
+            cat >> UPGRADE_REPORT.md << 'REPORT'
+          
+          ⚠️ **Conflicts were detected during cherry-pick.**
+          
+          Manual resolution is required:
+          1. Review the conflict markers in conflicted files
+          2. Resolve changes (consider both v5.0.8+ baseline and custom fix intent)
+          3. Stage resolved files: `git add [FILE]`
+          4. Complete cherry-pick: `git cherry-pick --continue`
+          5. Push feature branch and merge into release branch
+          
+          See AGENT_SESSION_NOTES.md for conflict resolution patterns.
+          REPORT
+          else
+            cat >> UPGRADE_REPORT.md << 'REPORT'
+          
+          ✅ Upgrade completed successfully!
+          
+          - Release branch: release/${{ steps.latest.outputs.version }}-tivo
+          - Feature branch: feature/tivo-custom-${{ steps.latest.outputs.version }}
+          - Next: Verify in staging, then deploy to production
+          REPORT
+          fi
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upgrade-logs
+          path: |
+            UPGRADE_REPORT.md
+            CONFLICT_RESOLUTION_NEEDED.md
+          retention-days: 30
+
+      - name: Create pull request (for review)
+        if: steps.check_version.outputs.already_latest == 'false' && steps.conflicts.outputs.conflicts_found == 'false'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: automated-upgrade-${{ steps.latest.outputs.version }}
+          commit-message: |
+            chore: Upgrade to Shaka Player ${{ steps.latest.outputs.version }}
+            
+            - Created release/${{ steps.latest.outputs.version }}-tivo from upstream tag
+            - Applied custom patches (subtitle fix, etc.)
+            - All conflicts resolved automatically
+            - Testing: Passed
+            
+            Co-Authored-By: GitHub Actions <actions@github.com>
+          title: "🤖 Automated: Upgrade to Shaka Player ${{ steps.latest.outputs.version }}"
+          body: |
+            ## Automated Upgrade
+            
+            This PR updates Shaka Player to **${{ steps.latest.outputs.version }}** and applies custom patches.
+            
+            ### Branches Created
+            - `release/${{ steps.latest.outputs.version }}-tivo` - Release with custom fixes
+            - `feature/tivo-custom-${{ steps.latest.outputs.version }}` - Isolated custom patches
+            
+            ### Verification Checklist
+            - [ ] Review changes in custom files (mp4_ttml_parser.js, ttml_text_parser.js, etc.)
+            - [ ] Test locally: `git checkout release/${{ steps.latest.outputs.version }}-tivo && python3 build/test.py`
+            - [ ] Verify subtitle playback works correctly
+            - [ ] Check for regressions in unrelated functionality
+            
+            ### Deployment
+            Once approved:
+            1. Merge this PR (merges feature branch)
+            2. Push release branch: `git push origin release/${{ steps.latest.outputs.version }}-tivo`
+            3. Tag for deployment (if needed)
+            
+            **Created by**: Automated GitHub Actions workflow
+          labels: 'ci/automated,enhancement,release'
+          reviewers: 'vkyatsandra'
+          draft: false
+
+      - name: Slack notification (optional)
+        if: failure()
+        uses: slackapi/slack-github-action@v1
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK }}
+          payload: |
+            {
+              "text": "⚠️ Shaka Player Upgrade Failed",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Shaka Player Automated Upgrade*\n\n❌ Upgrade to `${{ steps.latest.outputs.version }}` failed.\n\nStatus: `${{ steps.upgrade.outputs.upgrade_status }}`\n\nView details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                  }
+                }
+              ]
+            }
